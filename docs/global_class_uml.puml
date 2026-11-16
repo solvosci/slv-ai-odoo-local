@@ -1,0 +1,723 @@
+@startuml diagrama-clases-global
+' =====================================================================
+'  SOLVY - Diagrama de clases global
+'  DDD (bounded contexts) + Arquitectura hexagonal (puertos y adaptadores)
+'
+'  Dos sistemas colaboran:
+'   1) Odoo Host     -> addons slv_ai_base, slv_ai_chat, slv_ai_helpdesk
+'   2) AI Service    -> api/app (FastAPI + LangGraph), hexagonal
+' =====================================================================
+
+title Solvy - Diagrama de clases global (DDD + Hexagonal)
+
+' Necesario para mezclar clases con actor y cloud en el mismo diagrama
+allowmixing
+
+top to bottom direction
+skinparam shadowing false
+skinparam classAttributeIconSize 0
+skinparam packageStyle rectangle
+skinparam nodesep 40
+skinparam ranksep 55
+skinparam defaultFontName Helvetica
+skinparam note {
+  BackgroundColor #FFFBE6
+  BorderColor #B59B00
+  FontSize 11
+}
+skinparam class {
+  BackgroundColor #FFFFFF
+  BorderColor #444444
+}
+skinparam package {
+  BorderColor #666666
+  FontStyle bold
+}
+
+' ---------------------------------------------------------------------
+'  Leyenda general
+' ---------------------------------------------------------------------
+legend top left
+  <b>Estereotipos usados</b>
+  <<Entity>> / <<Value Object>> : modelo de dominio
+  <<Port>> : interfaz de la capa de aplicacion (hexagono)
+  <<Use Case>> : caso de uso (servicio de aplicacion)
+  <<Driving Adapter>> : adaptador primario (entra al hexagono)
+  <<Driven Adapter>> : adaptador secundario (sale del hexagono)
+  <<Composition Root>> : ensambla dependencias
+  <<Odoo Model>> : modelo ORM de Odoo
+endlegend
+
+' =====================================================================
+'  SISTEMA 1 : ODOO HOST
+' =====================================================================
+package "SISTEMA 1 - Odoo Host (addons)" as ODOO #F4F9FF {
+
+  ' -------------------------------------------------------------------
+  '  BC: Catalogo de herramientas (slv_ai_base + slv_ai_helpdesk)
+  ' -------------------------------------------------------------------
+  package "Bounded Context: Catalogo de Herramientas y Seguridad\n(slv_ai_base + slv_ai_helpdesk)" as BC_TOOLS #E8F1FF {
+
+    class Tool <<Value Object>> {
+      +name : str
+      +description : str
+      +input_schema : dict
+      +write : bool
+      +func : Callable
+      +to_dict() : dict
+    }
+
+    class "define_tool()" as DefineTool <<decorator>> {
+      +define_tool(name, description, input_schema, write) : decorator
+    }
+
+    class ToolCollection <<Entity>> {
+      +tools : list<Tool>
+      +add(tool)
+      +remove(tool)
+      +list() : list<Tool>
+      +list_tools_names() : list<str>
+      +define_tool(...)
+    }
+
+    class ToolManager <<Odoo Model>> {
+      _name = "solvy.tool.manager" (abstract)
+      +_get_tools() : list<Tool>
+      +_get_tool(name) : Tool
+      +_run_tool(name, arguments) : Any
+    }
+
+    class SolvyToolManager <<Odoo Model>> {
+      _inherit = "solvy.tool.manager"
+      +list_helpdesk_categories()
+      +create_helpdesk_categories()
+      +delete_helpdesk_categories()
+      +list_helpdesk_tags()
+      +create_helpdesk_tags()
+      +delete_helpdesk_tags()
+      +create_helpdesk_tickets()
+      +delete_helpdesk_tickets()
+    }
+
+    class TokenManager <<Domain Service>> {
+      +secret : str
+      +ttl_seconds : int = 60
+      +algorithm : str = "HS256"
+      +from_env(env) : TokenManager
+      +issue(user_id) : str
+      +verify(token) : int
+    }
+
+    class SolvyConfig <<Value Object>> {
+      +shared_secret : str
+      +ai_service_url : str
+      +token_ttl : int
+    }
+
+    class SolvySettings <<Odoo Model>> {
+      _name = "solvy.settings" (abstract)
+      +get_config() : SolvyConfig
+    }
+
+    class ResConfigSettings <<Odoo Model>> {
+      _inherit = "res.config.settings"
+    }
+
+    class ToolsController <<Driving Adapter>> {
+      GET  /solvy/tools
+      POST /solvy/tools/<name>
+      -_authenticate() : user_id | None
+      +tools()
+      +call_tool(name)
+    }
+
+    ToolCollection o-- "0..*" Tool
+    DefineTool ..> Tool : crea y adjunta\nfunc._solvy_tool
+    ToolManager ..> Tool : descubre via\n_solvy_tool
+    SolvyToolManager --|> ToolManager : _inherit
+    SolvyToolManager ..> DefineTool : decora cada\nherramienta
+    SolvySettings ..> SolvyConfig : devuelve
+    TokenManager ..> SolvyConfig : from_env lee
+    ToolsController ..> TokenManager : verify(JWT)
+    ToolsController ..> ToolManager : _get_tools /\n_run_tool
+    ResConfigSettings ..> SolvySettings : edita parametros
+  }
+
+  ' -------------------------------------------------------------------
+  '  BC: Chat (slv_ai_chat)
+  ' -------------------------------------------------------------------
+  package "Bounded Context: Chat de Usuario\n(slv_ai_chat)" as BC_CHAT #E8FFF0 {
+
+    enum ChatMessageRole {
+      USER
+      ASSISTANT
+      CONFIRMATION
+    }
+
+    enum ConfirmationDecision {
+      PENDING
+      APPROVED
+      REJECTED
+      EXPIRED
+    }
+
+    class ChatIdentifier <<Value Object>> {
+      +thread_id : str
+      +user_id : int
+      +scoped_thread_id : str
+    }
+
+    class Chat <<Odoo Model>> {
+      _name = "solvy.chat"
+      +user_id : Many2one<res.users>
+      +thread_id : Char (unico)
+      +message_ids : One2many<Message>
+      +pending_message_id : Many2one (computed)
+      +_find_for_identifier(identifier) : Chat
+      +_append_messages(vals_list) : Messages
+    }
+
+    class Message <<Odoo Model>> {
+      _name = "solvy.chat.message"
+      +chat_id : Many2one<Chat>
+      +role : ChatMessageRole
+      +content : Text
+      +interrupt_id : Char
+      +tool_name : Char
+      +tool_arguments : Json
+      +decision : ConfirmationDecision
+      +attachment_ids : Many2many<ir.attachment>
+      +_attach_images(images)
+      +_to_client_dict() : dict
+      #_check_confirmation_fields()
+    }
+
+    class ChatIdentifierService <<Domain Service>> {
+      +get_or_create(user_id, thread_id) : ChatIdentifier
+    }
+
+    class AIServiceClient <<Driven Adapter>> {
+      +base_url : str
+      +timeout : int = 300
+      +from_env(env) : AIServiceClient
+      +send_message(chat_id, token, message, images)
+      +send_decision(chat_id, token, decision)
+      +transcribe(audio, filename, content_type, language)
+      -_post(path, ...)
+    }
+
+    class AiServiceUnavailable <<Exception>>
+    class AiServiceRejected <<Exception>> {
+      +status : int
+    }
+
+    class ChatController <<Driving Adapter>> {
+      POST /solvy/chat       (json, auth=user)
+      POST /solvy/transcribe (http, auth=user)
+      +chat(message, thread_id, decision, images)
+      +transcribe(language)
+      -_validate_images(images)
+      -_ask_assistant(...)
+      -_save_messages(...)
+    }
+
+    Chat "1" *-- "0..*" Message : message_ids
+    Message ..> ChatMessageRole
+    Message ..> ConfirmationDecision
+    ChatIdentifierService ..> ChatIdentifier : crea
+    ChatController ..> ChatIdentifierService
+    ChatController ..> Chat : busca / crea
+    ChatController ..> AIServiceClient : delega en IA
+    ChatController ..> TokenManager : issue(JWT)
+    AIServiceClient ..> AiServiceUnavailable : lanza
+    AIServiceClient ..> AiServiceRejected : lanza
+    AIServiceClient ..> SolvySettings : from_env
+  }
+
+}
+
+' =====================================================================
+'  SISTEMA 2 : AI SERVICE (HEXAGONAL)
+' =====================================================================
+package "SISTEMA 2 - AI Service (api/app) - Arquitectura Hexagonal" as API #FFF8F0 {
+
+  ' ===================================================================
+  '  CAPA: DOMINIO
+  ' ===================================================================
+  package "DOMINIO (nucleo del hexagono)" as DOMAIN #FFF0E0 {
+
+    package "BC: Conversacion con el Asistente" as BC_CONV #FFE6CC {
+
+      class Reply <<Value Object>> {
+        +type : "message" | "confirmation"
+        +text : str | None
+        +confirmation : Confirmation | None
+        {static} +message(text) : Reply
+        {static} +confirm(confirmation) : Reply
+      }
+
+      class Confirmation <<Value Object>> {
+        +interrupt_id : str
+        +tool : str
+        +arguments : dict
+        +summary : str
+      }
+
+      class Decision <<Value Object>> {
+        +interrupt_id : str
+        +approved : bool
+      }
+
+      class Image <<Value Object>> {
+        +mime_type : str
+        +data : str (base64)
+        +name : str | None
+        +data_url : str
+      }
+
+      class ToolSpec <<Value Object>> {
+        +name : str
+        +description : str
+        +input_schema : dict
+        +write : bool
+      }
+
+      Reply "1" o-- "0..1" Confirmation
+      Decision ..> Confirmation : responde a\n(interrupt_id)
+    }
+
+    package "BC: Transcripcion de Audio" as BC_TRANS #FFE6CC {
+      class Transcription <<Value Object>> {
+        +text : str
+        +language : str
+      }
+    }
+  }
+
+  ' ===================================================================
+  '  CAPA: APLICACION
+  ' ===================================================================
+  package "APLICACION (casos de uso + puertos)" as APP #FFFFE0 {
+
+    package "Puertos de salida (driven ports)" as PORTS #FFFFCC {
+      interface Assistant <<Port>> {
+        +reply(thread_id, message, token, images) : Reply
+        +resume(thread_id, decision, token) : Reply
+      }
+
+      interface ToolGateway <<Port>> {
+        +list_tools(token) : list<ToolSpec>
+        +call_tool(token, name, arguments) : dict
+      }
+
+      interface ConversationLock <<Port>> {
+        +hold(thread_id) : ContextManager
+      }
+
+      interface Transcriber <<Port>> {
+        +transcribe(audio, language) : Transcription
+      }
+    }
+
+    package "Casos de uso (puertos de entrada)" as USECASES #FFFFCC {
+      class SendMessageUseCase <<Use Case>> {
+        +assistant : Assistant
+        +lock : ConversationLock
+        +execute(thread_id, token, message, images) : Reply
+      }
+
+      class SendDecisionUseCase <<Use Case>> {
+        +assistant : Assistant
+        +lock : ConversationLock
+        +execute(thread_id, token, decision) : Reply
+      }
+
+      class TranscribeMessageUseCase <<Use Case>> {
+        +transcriber : Transcriber
+        +execute(audio, language) : Transcription
+      }
+    }
+
+    package "Errores de aplicacion" as ERRORS #FFFFCC {
+      class InvalidAudio <<Exception>>
+      class ServiceUnavailable <<Exception>>
+      class ToolRejected <<Exception>>
+    }
+
+    SendMessageUseCase ..> Assistant
+    SendMessageUseCase ..> ConversationLock
+    SendDecisionUseCase ..> Assistant
+    SendDecisionUseCase ..> ConversationLock
+    TranscribeMessageUseCase ..> Transcriber
+    TranscribeMessageUseCase ..> InvalidAudio : audio vacio
+  }
+
+  ' ===================================================================
+  '  ADAPTADORES PRIMARIOS (DRIVING)
+  ' ===================================================================
+  package "ADAPTADORES PRIMARIOS (driving / entrada)" as DRIVING #E8E8FF {
+
+    package "interfaces/" as IFACES #DDDDFF {
+      class ChatController_API as "ChatController" <<Driving Adapter>> {
+        +send_message_use_case
+        +send_decision_use_case
+        +presenter : ChatPresenter
+        +handle_chat(request_data) : dict
+      }
+
+      class TranscriptionController <<Driving Adapter>> {
+        +transcribe_message_use_case
+        +presenter : TranscriptionPresenter
+        +handle_transcribe(audio, language) : dict
+      }
+
+      class ChatPresenter <<Presenter>> {
+        +present(reply : Reply) : dict
+      }
+
+      class TranscriptionPresenter <<Presenter>> {
+        +present(transcription) : dict
+      }
+    }
+
+    package "infrastructure/web (FastAPI)" as WEB #DDDDFF {
+      class "create_router()" as Router <<Driving Adapter>> {
+        POST /chat
+        POST /transcribe
+        (mapea errores a HTTP 400/413/502/503)
+      }
+
+      class ChatRequest <<DTO>> {
+        +thread_id : str
+        +token : str
+        +message : str | None
+        +images : list<ImageBody> (max 5)
+        +decision : DecisionBody | None
+        #exactly_one()
+      }
+
+      class ImageBody <<DTO>> {
+        +type : png|jpeg|webp
+        +data : base64 (max 5MB)
+        +name : str | None
+      }
+
+      class DecisionBody <<DTO>> {
+        +interrupt_id : str
+        +approved : bool
+      }
+
+      class "create_web_app()" as WebApp <<FastAPI app>>
+
+      ChatRequest *-- "0..5" ImageBody
+      ChatRequest *-- "0..1" DecisionBody
+      WebApp ..> Router
+      Router ..> ChatRequest : valida entrada
+    }
+
+    ChatController_API ..> ChatPresenter
+    TranscriptionController ..> TranscriptionPresenter
+    Router ..> ChatController_API
+    Router ..> TranscriptionController
+    Router ..> ServiceUnavailable : traduce a HTTP
+    Router ..> InvalidAudio : traduce a HTTP
+  }
+
+  ' ===================================================================
+  '  ADAPTADORES SECUNDARIOS (DRIVEN)
+  ' ===================================================================
+  package "ADAPTADORES SECUNDARIOS (driven / salida) - infrastructure/" as DRIVEN #EAF7EA {
+
+    package "assistants/ (LangGraph + LLM)" as ASSISTANTS #DDF0DD {
+      class LangGraphAssistant <<Driven Adapter>> {
+        +model : ChatModel
+        +gateway : ToolGateway
+        +tool_factory : LangGraphToolFactory
+        +system_prompt : str
+        +checkpointer : MemorySaver
+        +reply(thread_id, message, token, images) : Reply
+        +resume(thread_id, decision, token) : Reply
+        -_build_graph(token)
+        -_pending(graph, config)
+        -_to_reply(graph, config)
+      }
+
+      class LangGraphToolFactory <<Factory>> {
+        +gateway : ToolGateway
+        +build_all(specs, token) : list<StructuredTool>
+        +build(spec, token) : StructuredTool
+        -_approved(spec, arguments) : bool
+      }
+    }
+
+    package "gateways/" as GATEWAYS #DDF0DD {
+      class OdooToolGateway <<Driven Adapter>> {
+        +base_url : str
+        +timeout : int
+        +list_tools(token) : list<ToolSpec>
+        +call_tool(token, name, arguments) : dict
+        -_request(method, path, token, body)
+      }
+    }
+
+    package "transcribers/" as TRANSCRIBERS #DDF0DD {
+      class WhisperTranscriber <<Driven Adapter>> {
+        +model_size, device, compute_type
+        +beam_size, vad_filter
+        +transcribe(audio, language) : Transcription
+        -_get_model()
+      }
+
+      class MiniMaxTranscriber <<Driven Adapter>> {
+        +api_key, base_url, model
+        +transcribe(audio, language) : Transcription
+        -_to_wav(audio) : bytes
+      }
+    }
+
+    package "locking/" as LOCKING #DDF0DD {
+      class MemoryConversationLock <<Driven Adapter>> {
+        -_locks : defaultdict<Lock>
+        +hold(thread_id) : ContextManager
+      }
+    }
+
+    package "configuration/ (Composition Root)" as CONFIG #DDF0DD {
+      class Application <<Composition Root>> {
+        +tool_gateway : ToolGateway
+        +assistant : Assistant
+        +lock : ConversationLock
+        +transcriber : Transcriber
+        +chat_controller
+        +transcription_controller
+      }
+
+      class "create_application()" as CreateApp <<factory>>
+      class "create_transcriber()" as CreateTranscriber <<factory>>
+      class settings <<module>> {
+        ODOO_URL, MINIMAX_*, OLLAMA_*
+        WHISPER_*, TRANSCRIBER
+        SYSTEM_PROMPT
+      }
+    }
+  }
+
+  ' ===================================================================
+  '  Relaciones hexagonales: realizacion de puertos
+  ' ===================================================================
+  LangGraphAssistant ..|> Assistant
+  OdooToolGateway ..|> ToolGateway
+  MemoryConversationLock ..|> ConversationLock
+  WhisperTranscriber ..|> Transcriber
+  MiniMaxTranscriber ..|> Transcriber
+
+  LangGraphAssistant o-- ToolGateway
+  LangGraphAssistant *-- LangGraphToolFactory
+  LangGraphToolFactory o-- ToolGateway
+  LangGraphToolFactory ..> ToolSpec
+  LangGraphToolFactory ..> ToolRejected
+  LangGraphAssistant ..> Reply : produce
+  LangGraphAssistant ..> Confirmation : produce
+  LangGraphAssistant ..> Image : usa
+  LangGraphAssistant ..> Decision : usa
+  OdooToolGateway ..> ToolSpec : produce
+  OdooToolGateway ..> ServiceUnavailable
+  OdooToolGateway ..> ToolRejected
+  WhisperTranscriber ..> Transcription
+  MiniMaxTranscriber ..> Transcription
+  MiniMaxTranscriber ..> InvalidAudio
+  MiniMaxTranscriber ..> ServiceUnavailable
+  WhisperTranscriber ..> InvalidAudio
+  WhisperTranscriber ..> ServiceUnavailable
+
+  ChatController_API ..> SendMessageUseCase
+  ChatController_API ..> SendDecisionUseCase
+  TranscriptionController ..> TranscribeMessageUseCase
+  ChatController_API ..> Decision : construye
+  ChatController_API ..> Image : construye
+
+  CreateApp ..> Application : ensambla
+  CreateApp ..> CreateTranscriber
+  CreateApp ..> settings
+  Application ..> SendMessageUseCase : instancia
+  Application ..> SendDecisionUseCase : instancia
+  Application ..> TranscribeMessageUseCase : instancia
+  Application ..> ChatController_API : instancia
+  Application ..> TranscriptionController : instancia
+  CreateTranscriber ..> WhisperTranscriber : si TRANSCRIBER=whisper
+  CreateTranscriber ..> MiniMaxTranscriber : si TRANSCRIBER=minimax
+  WebApp ..> Application : recibe controladores
+}
+
+' =====================================================================
+'  SISTEMAS EXTERNOS
+' =====================================================================
+cloud "LLM Proveedor\n(MiniMax / Ollama)" as LLM #EEEEEE
+cloud "MiniMax ASR\n(speech_to_text)" as ASR #EEEEEE
+actor "Usuario Odoo\n(navegador / OWL)" as USER
+
+' =====================================================================
+'  RELACIONES ENTRE SISTEMAS (Context Map)
+' =====================================================================
+USER --> ChatController : POST /solvy/chat\nPOST /solvy/transcribe
+AIServiceClient --> Router : HTTP  /chat  /transcribe\n(thread_id, JWT, message|decision)
+OdooToolGateway --> ToolsController : HTTP + Bearer JWT\nGET /solvy/tools\nPOST /solvy/tools/<name>
+LangGraphAssistant ..> LLM : prompt + tools
+MiniMaxTranscriber ..> ASR : audio WAV 16 kHz
+ToolSpec .. Tool : Shared Kernel\n(mismo contrato JSON:\nname, description,\ninput_schema, write)
+
+' =====================================================================
+'  NOTAS DETALLADAS (explicacion en parrafos)
+' =====================================================================
+
+note as N_GLOBAL
+  <b>Vision global del sistema</b>
+
+  Solvy es un asistente conversacional integrado en Odoo. Se compone de dos sistemas desplegados por separado que
+  colaboran por HTTP: el Odoo Host, que aloja la interfaz de chat, la persistencia de las conversaciones y el catalogo
+  de herramientas que el asistente puede ejecutar sobre los datos de la empresa, y el AI Service, un microservicio
+  FastAPI que contiene la inteligencia (LLM con LangGraph) y la transcripcion de audio.
+
+  El principio de seguridad central es que el AI Service nunca tiene credenciales propias sobre Odoo. Cada peticion de
+  chat viaja con un JWT de vida corta emitido por Odoo para el usuario concreto. Cuando el asistente quiere ejecutar una
+  herramienta, el AI Service devuelve ese mismo JWT a Odoo, que lo verifica y ejecuta la accion con los permisos
+  (ACL y reglas de registro) del usuario original.
+end note
+
+note as N_ODOO_TOOLS
+  <b>BC Catalogo de Herramientas y Seguridad (slv_ai_base + slv_ai_helpdesk)</b>
+
+  Este contexto responde a la pregunta "que puede hacer el asistente y con que permisos". El decorador define_tool
+  convierte un metodo de un modelo Odoo en una Tool: un value object con nombre, descripcion en lenguaje natural, un
+  JSON Schema que valida los argumentos, y la marca write que indica si la accion modifica datos. ToolManager, un
+  modelo abstracto, descubre por introspeccion todos los metodos decorados, valida los argumentos con jsonschema y los
+  ejecuta dentro de un savepoint para que un fallo no deje cambios a medias.
+
+  Cada modulo de negocio amplia el catalogo heredando solvy.tool.manager (por ejemplo slv_ai_helpdesk anade las
+  herramientas de tickets, categorias y etiquetas), sin tocar el codigo base: es el punto de extension del dominio.
+  TokenManager emite y verifica los JWT HS256 con el secreto compartido guardado en ir.config_parameter, y ToolsController
+  es el adaptador primario que expone el catalogo por HTTP traduciendo las excepciones de Odoo a codigos 400, 403, 404,
+  422 y 500.
+end note
+
+note as N_ODOO_CHAT
+  <b>BC Chat de Usuario (slv_ai_chat)</b>
+
+  Este contexto es dueño de la conversacion tal y como la ve el usuario. Chat es el agregado raiz: pertenece a un
+  usuario, se identifica por un thread_id unico y contiene sus Message, que pueden ser del usuario, del asistente o de
+  tipo confirmacion. Un mensaje de confirmacion guarda la herramienta y los argumentos que el asistente quiere ejecutar
+  y una decision que evoluciona de pending a approved, rejected o expired; una restriccion de modelo garantiza que solo
+  estos mensajes llevan datos de herramienta. Solo puede haber una confirmacion pendiente por chat, calculada en
+  pending_message_id.
+
+  ChatIdentifier es un value object que combina usuario y hilo; su scoped_thread_id (user_id:thread_id) es el
+  identificador que se envia al AI Service, de modo que dos usuarios nunca pueden compartir ni adivinar el hilo del otro.
+  ChatController orquesta el caso: valida imagenes, emite el JWT, delega en AIServiceClient (el adaptador secundario
+  hacia el servicio de IA), y persiste la respuesta. Las cuatro fases de una peticion son validar, preguntar al
+  asistente, guardar y devolver.
+end note
+
+note as N_DOMAIN
+  <b>Dominio del AI Service</b>
+
+  El dominio es deliberadamente pequeño y esta compuesto solo por value objects inmutables (dataclasses congeladas) sin
+  dependencias de frameworks. Reply es la respuesta del asistente y puede ser un mensaje de texto o una peticion de
+  confirmacion; Confirmation describe la accion de escritura que espera aprobacion humana; Decision es la respuesta del
+  usuario (aprobar o rechazar) identificada por el interrupt_id; Image encapsula una imagen en base64 con su data URL; y
+  ToolSpec es la descripcion de una herramienta que el asistente puede invocar.
+
+  Transcription pertenece a un contexto distinto y aislado (transcripcion de audio) que no comparte vocabulario con la
+  conversacion; por eso se separa en su propio bounded context aunque conviva en el mismo servicio.
+end note
+
+note as N_APP
+  <b>Capa de aplicacion</b>
+
+  Aqui viven los casos de uso y los puertos. Un caso de uso es una operacion de negocio completa que depende solo de
+  abstracciones. SendMessageUseCase y SendDecisionUseCase adquieren primero el ConversationLock del hilo y despues
+  delegan en el Assistant, lo que garantiza que dos peticiones simultaneas de la misma conversacion no se mezclen.
+  TranscribeMessageUseCase rechaza audios vacios con InvalidAudio y delega en el Transcriber.
+
+  Los puertos (Assistant, ToolGateway, ConversationLock, Transcriber) son interfaces que expresan lo que el nucleo
+  necesita del mundo exterior en el lenguaje del dominio. Los errores (InvalidAudio, ServiceUnavailable, ToolRejected)
+  tambien son parte de la aplicacion, de manera que los adaptadores los lancen y los adaptadores primarios los traduzcan
+  sin que el nucleo conozca HTTP.
+end note
+
+note as N_DRIVING
+  <b>Adaptadores primarios (driving)</b>
+
+  Son la puerta de entrada al hexagono. El router FastAPI recibe peticiones HTTP, las valida con los DTO de pydantic
+  (ChatRequest exige exactamente uno entre mensaje con imagenes o decision; ImageBody limita tipo y tamaño) y llama al
+  controlador correspondiente. Los controladores convierten los datos crudos en objetos de dominio (Decision, Image),
+  invocan el caso de uso y entregan el resultado a un presenter que lo formatea como diccionario serializable.
+
+  La traduccion de errores de aplicacion a codigos HTTP (400 audio invalido, 413 fichero grande, 502 y 503 servicio no
+  disponible) se hace aqui y solo aqui, manteniendo limpio el interior.
+end note
+
+note as N_LANGGRAPH
+  <b>LangGraphAssistant y el flujo human-in-the-loop</b>
+
+  Es el adaptador mas importante: implementa el puerto Assistant con un agente de LangGraph. En cada peticion pide el
+  catalogo de herramientas a Odoo mediante el gateway, lo convierte en herramientas de LangChain con
+  LangGraphToolFactory y construye el agente con el prompt de sistema y un checkpointer en memoria que conserva el
+  historial por thread_id.
+
+  Cuando el LLM decide usar una herramienta de escritura (write=True), la factoria no la ejecuta: lanza un interrupt de
+  LangGraph que pausa el grafo. El adaptador detecta esa pausa y devuelve un Reply de tipo confirmation. Mas tarde, la
+  Decision del usuario llega a resume(), que reanuda el grafo: si fue aprobada la herramienta se ejecuta contra Odoo, y
+  si no, el LLM recibe el aviso de cancelacion. Mientras hay una accion pendiente, nuevos mensajes se rechazan. Las
+  decisiones con un interrupt_id que ya no coincide se responden como "ya procesada", haciendo la operacion idempotente.
+end note
+
+note as N_DRIVEN
+  <b>Adaptadores secundarios (driven)</b>
+
+  Implementan los puertos con tecnologia concreta y son intercambiables sin tocar el nucleo. OdooToolGateway habla con
+  Odoo por HTTP con el JWT como Bearer y traduce las respuestas: 5xx o fallos de red se convierten en ServiceUnavailable
+  y 4xx en ToolRejected, que el LLM ve como un mensaje de error comprensible.
+
+  Hay dos transcriptores equivalentes que se eligen por configuracion: WhisperTranscriber ejecuta faster-whisper en local
+  (carga el modelo de forma perezosa y protegida por un lock) y MiniMaxTranscriber convierte el audio a WAV de 16 kHz y
+  lo envia al servicio ASR externo. MemoryConversationLock mantiene un mutex por hilo en memoria, por lo que solo es
+  valido con un unico proceso; para escalar habria que sustituirlo por un lock distribuido sin cambiar los casos de uso,
+  y lo mismo aplica al MemorySaver del checkpointer.
+end note
+
+note as N_ROOT
+  <b>Composition Root</b>
+
+  Application y create_application son el unico lugar que conoce todas las clases concretas. Leen las variables de
+  entorno de settings, crean el gateway, el modelo de lenguaje, el asistente, el lock y el transcriptor elegido, e
+  inyectan esas dependencias en los casos de uso y controladores. main.py construye la aplicacion y se la entrega a
+  create_web_app. Gracias a este ensamblado, la direccion de las dependencias siempre apunta hacia el dominio.
+end note
+
+note as N_MAP
+  <b>Context Map entre sistemas</b>
+
+  La relacion entre el Odoo Host y el AI Service es de tipo Customer/Supplier con un Shared Kernel minimo: ambos acuerdan
+  el contrato JSON de una herramienta (name, description, input_schema, write), que en Odoo es Tool y en el AI Service es
+  ToolSpec, sin compartir codigo. Cada lado se protege con una capa anticorrupcion: AIServiceClient en Odoo y
+  OdooToolGateway en el AI Service traducen el protocolo ajeno a su propio lenguaje.
+
+  El flujo tipico es: el usuario escribe, ChatController de Odoo emite un JWT y llama a POST /chat; el AI Service pide
+  las herramientas a Odoo, el LLM razona, y si hay escritura devuelve una confirmacion; Odoo la guarda como Message
+  pendiente y la muestra; el usuario decide y el ciclo se repite con una decision hasta obtener la respuesta final.
+end note
+
+' Anclaje de notas a sus paquetes
+' (se anclan a clases, no a paquetes, porque Smetana falla con aristas a paquetes)
+N_GLOBAL .. TokenManager
+N_ODOO_TOOLS .. ToolManager
+N_ODOO_CHAT .. Chat
+N_DOMAIN .. Reply
+N_APP .. SendMessageUseCase
+N_DRIVING .. Router
+N_LANGGRAPH .. LangGraphAssistant
+N_DRIVEN .. OdooToolGateway
+N_ROOT .. Application
+N_MAP .. AIServiceClient
+
+@enduml
