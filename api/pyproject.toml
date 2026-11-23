@@ -1,0 +1,21 @@
+[project]
+name = "slv-ai-api"
+version = "0.1.0"
+description = "SLV AI API"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]",
+    "langchain",
+    "langgraph",
+    "langchain-ollama",
+    "requests",
+    "faster-whisper>=1.2.1",
+    # faster-whisper passes metadata_errors to av.open(), removed in PyAV 19
+    "av<19",
+    "langchain-openai>=1.7.4",
+    "langsmith>=0.14.17",
+    "pydub>=0.25.1",
+    "pytesseract>=0.3.13",
+    "pillow>=13.0.0",
+    "pypdfium2>=5.15.2",
+]
